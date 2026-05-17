@@ -1,144 +1,126 @@
-# Side-Net: Filecoin-Compatible Side-Node Cache Network
+# side-net
 
-This project builds a **Side-Node caching network** for Filecoin pieces so that once a full Merkle tree
-(Fr32 + Poseidon, arity=8) has been computed by anyone, later verifiers/retrievers can avoid re-reading the
-entire piece: they download only the **target window data** plus **O(log N) × 32B** siblings from the cache.
+Verified retrieval cache pipeline for building and serving Merkle side-node
+proofs.
 
-## Architecture
+This repo builds a cache layer for large content-addressed objects. Once a full
+object has been retrieved and its Merkle tree has been computed, later clients
+can verify partial retrievals by combining the requested byte range with cached
+side nodes instead of downloading the full object again.
+
+The current implementation is Filecoin-compatible, using Fr32 and Poseidon
+parameters, but the engineering pattern is a general verified-cache pipeline:
+consume successful retrieval records, build proof artifacts, store them, and let
+future reads validate against a known root.
+
+## Pipeline
 
 ```
-claims_task_result (Mongo, producer)
-      │ (success=true, http module)
-      ▼
-full-tree-worker (Go)
-  ├─ parse provider multiaddrs → ip:port
-  ├─ download piece: http://{ip}:{port}/piece/{cid}
-  ├─ invoke piece-tree-cli (Rust)
-  │     • Fr32 chunking (32B) → Poseidon (arity 8) Merkle
-  │     • export window paths (siblings from window-root to piece-root)
-  └─ store JSON into Mongo collection: side_window_paths
-            (piece, built_at, root, arity, leaf_size, window_size_bytes, paths)
+retrieval result queue
+      |
+      v
+full-tree worker
+      |
+      +--> parse provider addresses
+      +--> download source object
+      +--> run Merkle tree builder
+      +--> validate computed root
+      |
+      v
+side-node / window-path store
+      |
+      v
+partial retrieval verification
 ```
 
-## Full-Tree Construction (Overview)
+## Components
 
-- **Leaves**: map 32-byte chunks of the piece into field elements (**Fr32**) and use them as tree leaves.
-- **Hasher**: Filecoin uses **Poseidon** over the BLS12-381 scalar field with arity **8**.
-- **Padding / Power-of-arity**: the number of leaves is padded up to a multiple of 8^k so the final root is well-defined.
-- **Window Path**: for a window (e.g., 1 MiB = 1<<20 bytes), we compute the siblings on each level from the **window root** up to the **piece root**.  
-  Those siblings are cached in Mongo so that provers can combine their locally-calculated lower part with the cached siblings to get the root.
+- **Go worker** in `cmd/full-tree-worker`
+  - polls successful retrieval records
+  - downloads the source object
+  - invokes the tree-building CLI
+  - writes proof artifacts to MongoDB
 
-> **Note**: For *bit-accurate* production parity with Lotus miners, integrate the exact Fr32 packing pipeline used by
-> `rust-fil-proofs`. This CLI maps 32B chunks to `Fr` using `bytes_into_fr` and is suitable for building a compatible tree
-> and window proofs in most practical scenarios. Replace with end-to-end sector pipelines if your environment requires strict bit-level compatibility.
+- **Rust CLI** in `cmd/piece-tree-cli`
+  - reads raw bytes from stdin
+  - maps chunks into field elements
+  - builds a Poseidon Merkle tree
+  - emits window paths as JSON
 
-## Repositories / Components
+- **Mongo collections**
+  - `claims_task_result`: input records from retrieval jobs
+  - `side_window_paths`: cached proof artifacts for later verification
 
-- **Rust CLI** `cmd/piece-tree-cli`: reads raw piece bytes from **stdin**, outputs JSON with:
-  ```json
-  {
-    "hash_algo":"poseidon-filecoin",
-    "arity":8,
-    "leaf_size":32,
-    "total_leaves": "...",
-    "root": "hex32",
-    "window_size_bytes": 1048576,
-    "window_paths":[
-      {"window_id":0,"start_leaf":0,"leaf_count":..., "siblings":[["hex32","..."], ["..."]]} , ...
-    ]
-  }
-  ```
-- **Go Worker** `cmd/full-tree-worker`: polls `claims_task_result` (success=true, module=http), downloads the piece from the provider’s HTTP endpoint derived from multiaddrs, pipes it to the Rust CLI, then upserts to `side_window_paths`. If download/build fails, it marks the record as `result.success=false` with an error code/message.
+## Output Shape
 
-## Dependencies
+The tree builder emits JSON like:
 
-- **Rust** 1.68+ (Cargo)  
-- **Go** 1.22+  
-- **MongoDB** 5.x+  
-- Linux/macOS (recommended; Windows WSL works as well)
-
-### Rust crates
-- `storage-proofs-core` (from `rust-fil-proofs`)
-- `neptune`, `blstrs`, `serde`, `serde_json`, `anyhow`, `hex`
-
-### Go modules
-- `go.mongodb.org/mongo-driver`
-- `github.com/multiformats/go-multiaddr`
+```json
+{
+  "hash_algo": "poseidon-filecoin",
+  "arity": 8,
+  "leaf_size": 32,
+  "total_leaves": "...",
+  "root": "hex32",
+  "window_size_bytes": 1048576,
+  "window_paths": [
+    {
+      "window_id": 0,
+      "start_leaf": 0,
+      "leaf_count": 32768,
+      "siblings": [["hex32", "..."]]
+    }
+  ]
+}
+```
 
 ## Build
 
-### Makefile
 ```bash
 make build-rust
-make install-rust     # installs /usr/local/bin/piece-tree-cli
-make build-go         # builds ./bin/full-tree-worker
+make build-go
 ```
 
-### Manual
+Manual build:
+
 ```bash
-# Rust
 cd cmd/piece-tree-cli
 cargo build --release
-sudo install -m 0755 target/release/piece-tree-cli /usr/local/bin/piece-tree-cli
 
-# Go
 cd ../..
 go mod tidy
 go build -o bin/full-tree-worker ./cmd/full-tree-worker
 ```
 
-## Configuration & Deployment
+## Run
 
-### Environment Variables (Go Worker)
 ```bash
 export MONGO_URI="mongodb://127.0.0.1:27017"
 export MONGO_DB="fil"
-# Optional: adjust ticker interval in code if needed
-```
 
-### Mongo Collections
-- **claims_task_result**: input queue (produced by your retrieval program).
-- **side_window_paths**: output cache for window paths:
-  ```json
-  {
-    "piece": "baga...",
-    "built_at": "...",
-    "hash_algo": "poseidon-filecoin",
-    "arity": 8,
-    "leaf_size": 32,
-    "root": "hex32",
-    "window_size_bytes": 1048576,
-    "paths": [ ... ],
-    "meta": { "impl": "poseidon-filecoin" }
-  }
-  ```
-
-### Run
-```bash
-# Ensure piece-tree-cli is available in PATH
-which piece-tree-cli
-
-# Start worker
 ./bin/full-tree-worker
-# or
-go run ./cmd/full-tree-worker
 ```
 
 ## Operational Notes
 
-- The worker picks the **most recent** `success=true` entry. For scale-out, shard by piece CID or add a small work-queue to avoid duplicate processing.
-- If the HTTP download returns non-200 or stream fails, the record is marked failed with `download_error`.
-- If the CLI fails or outputs invalid JSON, the record is marked failed with `build_error`.
-- Window size is set to **1 MiB** by default; tune in the Rust CLI as needed.
-- For production, consider:
-  - Storing per-node `(piece, level, index) -> node_hash` to enable `GET /sidenodes/{piece}/{level}/{index}` style serving.
-  - Adding gRPC/HTTP read-only APIs to expose the cache.
-  - Replicating hot pieces to Redis/edge POPs/CDN for low latency.
+- Workers should shard by object id or use an explicit work queue at scale.
+- Failed downloads should be marked with structured error codes.
+- Invalid tree-builder output should be treated as a build error.
+- Window size is 1 MiB by default.
+- Hot proof artifacts can be replicated to Redis, object storage, or edge POPs.
+- Cache data is untrusted; incorrect siblings fail root validation.
 
-## Security
+## Why This Repo Belongs In The Portfolio
 
-No trust required in the side-node: wrong siblings yield a root mismatch against the on-chain CommP/PieceCID and verification fails deterministically.
+`side-net` shows low-level data infrastructure work:
+
+- streaming downloads into compute jobs
+- cross-language worker orchestration
+- reproducible proof artifact generation
+- cache design for partial reads
+- validation-first storage of derived data
+- operational failure handling around expensive jobs
 
 ## License
 
-Apache-2.0 (adjust to your org’s policy).
+Apache-2.0.
