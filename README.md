@@ -1,4 +1,4 @@
-# side-net
+# verified-retrieval-cache
 
 Verified retrieval cache pipeline for building and serving Merkle side-node
 proofs.
@@ -112,7 +112,7 @@ export MONGO_DB="fil"
 
 ## Why This Repo Belongs In The Portfolio
 
-`side-net` shows low-level data infrastructure work:
+`verified-retrieval-cache` shows low-level data infrastructure work:
 
 - streaming downloads into compute jobs
 - cross-language worker orchestration
