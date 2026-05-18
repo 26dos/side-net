@@ -13,6 +13,16 @@ parameters, but the engineering pattern is a general verified-cache pipeline:
 consume successful retrieval records, build proof artifacts, store them, and let
 future reads validate against a known root.
 
+## Demo Snapshot
+
+![Verified retrieval cache demo](docs/assets/screenshots/verified-cache-demo.png)
+
+The demo shows successful full retrievals becoming Merkle side-node artifacts
+that later clients can use for partial-read verification.
+
+See [docs/demo-walkthrough.md](docs/demo-walkthrough.md) for a proof flow,
+sequence diagram, and sample window-path artifact.
+
 ## Pipeline
 
 ```
